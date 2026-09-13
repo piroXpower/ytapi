@@ -18,17 +18,15 @@ DATABASE_URL = os.environ.get(
     "postgresql://neondb_owner:npg_yhbA5zJaf9ce@ep-nameless-queen-az3g147r-pooler.c-3.ap-southeast-1.aws.neon.tech/neondb?sslmode=require"
 )
 
-# In-memory fast cache (4-hour TTL)
 URL_CACHE = TTLCache(maxsize=10000, ttl=14400)
 SEARCH_CACHE = TTLCache(maxsize=2000, ttl=3600)
 
-# High-reliability distributed Invidious mirrors
 FALLBACK_INSTANCES = [
+    "https://api.piped.private.coffee",
+    "https://pipedapi.kavin.rocks",
     "https://inv.tux.pizza",
     "https://invidious.nerdvpn.de",
     "https://invidious.projectsegfau.lt",
-    "https://yt.drgnz.club",
-    "https://invidious.private.coffee"
 ]
 
 db_pool = None
@@ -109,8 +107,6 @@ def get_user_data(username: str):
         return None
 
 
-# --- High-Speed Media Resolvers ---
-
 def get_yt_format_selector(media_type: str, quality: str) -> str:
     if media_type == "video":
         if quality == "720":
@@ -148,23 +144,52 @@ def _extract_local(video_id: str, media_type: str, quality: str) -> str:
         return info.get("url")
 
 
+async def run_local_task(video_id: str, media_type: str, quality: str) -> str:
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(None, _extract_local, video_id, media_type, quality)
+    except Exception:
+        return None
+
+
 async def _fetch_single_instance(instance: str, video_id: str, media_type: str) -> str:
-    api_url = f"{instance}/api/v1/videos/{video_id}"
-    timeout = aiohttp.ClientTimeout(total=3.5)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(api_url) as resp:
-            if resp.status != 200:
-                return None
-            data = await resp.json()
-            if media_type == "video":
-                formats = data.get("formatStreams", [])
-                if formats:
-                    return formats[-1].get("url")
+    try:
+        timeout = aiohttp.ClientTimeout(total=4.0)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            # Check if instance is Piped API
+            if "piped" in instance:
+                api_url = f"{instance}/streams/{video_id}"
+                async with session.get(api_url) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json()
+                    if media_type == "video":
+                        streams = data.get("videoStreams", [])
+                        for s in streams:
+                            if not s.get("videoOnly", False):
+                                return s.get("url")
+                    else:
+                        streams = data.get("audioStreams", [])
+                        if streams:
+                            return streams[0].get("url")
             else:
-                formats = data.get("adaptiveFormats", [])
-                for stream_entry in formats:
-                    if stream_entry.get("type", "").startswith("audio/"):
-                        return stream_entry.get("url")
+                # Invidious format
+                api_url = f"{instance}/api/v1/videos/{video_id}"
+                async with session.get(api_url) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json()
+                    if media_type == "video":
+                        formats = data.get("formatStreams", [])
+                        if formats:
+                            return formats[-1].get("url")
+                    else:
+                        formats = data.get("adaptiveFormats", [])
+                        for s in formats:
+                            if s.get("type", "").startswith("audio/"):
+                                return s.get("url")
+    except Exception:
+        return None
     return None
 
 
@@ -173,17 +198,14 @@ async def get_stream_url_fastest(video_id: str, media_type: str, quality: str) -
     if cache_key in URL_CACHE:
         return URL_CACHE[cache_key]
 
-    loop = asyncio.get_running_loop()
-
-    # Create parallel tasks: local yt-dlp worker + top 3 fallback instances
     tasks = [
-        asyncio.create_task(loop.run_in_executor(None, _extract_local, video_id, media_type, quality)),
+        asyncio.create_task(run_local_task(video_id, media_type, quality)),
         asyncio.create_task(_fetch_single_instance(FALLBACK_INSTANCES[0], video_id, media_type)),
         asyncio.create_task(_fetch_single_instance(FALLBACK_INSTANCES[1], video_id, media_type)),
         asyncio.create_task(_fetch_single_instance(FALLBACK_INSTANCES[2], video_id, media_type)),
+        asyncio.create_task(_fetch_single_instance(FALLBACK_INSTANCES[3], video_id, media_type)),
     ]
 
-    # Competitive race: first task to successfully return a non-null URL wins
     resolved_url = None
     for completed in asyncio.as_completed(tasks):
         try:
@@ -194,10 +216,9 @@ async def get_stream_url_fastest(video_id: str, media_type: str, quality: str) -
         except Exception:
             continue
 
-    # Cleanup background tasks
-    for task in tasks:
-        if not task.done():
-            task.cancel()
+    for t in tasks:
+        if not t.done():
+            t.cancel()
 
     if resolved_url:
         URL_CACHE[cache_key] = resolved_url
@@ -213,12 +234,15 @@ def _search_tracks(query: str, limit: int = 5):
         "no_warnings": True,
         "extract_flat": "in_playlist",
     }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        res = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
-        return [
-            {"id": e.get("id"), "title": e.get("title"), "duration": e.get("duration"), "url": f"https://www.youtube.com/watch?v={e.get('id')}"}
-            for e in res.get("entries", [])
-        ]
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            res = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
+            return [
+                {"id": e.get("id"), "title": e.get("title"), "duration": e.get("duration"), "url": f"https://www.youtube.com/watch?v={e.get('id')}"}
+                for e in res.get("entries", [])
+            ]
+    except Exception:
+        return []
 
 
 async def stream_raw_chunks(source_url: str, request_range: str = None):
@@ -230,11 +254,9 @@ async def stream_raw_chunks(source_url: str, request_range: str = None):
     timeout = aiohttp.ClientTimeout(total=None, sock_read=30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.get(source_url, headers=headers) as resp:
-            async for chunk in resp.content.iter_chunked(131072):  # 128 KB buffer
+            async for chunk in resp.content.iter_chunked(131072):
                 yield chunk
 
-
-# --- Routing & Application Endpoints ---
 
 @app.get("/health")
 async def health():
