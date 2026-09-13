@@ -126,7 +126,8 @@ def _extract_media(video_id: str, media_type: str, quality: str) -> str:
         "extract_flat": False,
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "ios"],
+                # Prioritize iOS and TV embedded clients to bypass standard bot detection
+                "player_client": ["ios", "tv_embedded", "android"],
                 "skip": ["webpage", "configs"],
             }
         },
@@ -149,7 +150,17 @@ async def get_stream_url_cached(video_id: str, media_type: str, quality: str) ->
 
 
 def _search_tracks(query: str, limit: int = 5):
-    ydl_opts = {"format": "bestaudio", "quiet": True, "no_warnings": True, "extract_flat": "in_playlist"}
+    ydl_opts = {
+        "format": "bestaudio",
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": "in_playlist",
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["ios", "tv_embedded", "android"],
+            }
+        },
+    }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         res = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
         return [
@@ -159,7 +170,7 @@ def _search_tracks(query: str, limit: int = 5):
 
 
 async def stream_raw_chunks(source_url: str, request_range: str = None):
-    headers = {"User-Agent": "com.google.android.youtube/19.29.37 (Linux; U; Android 11) gzip"}
+    headers = {"User-Agent": "com.google.ios.youtube/19.29.1 (iPhone14,3; iOS 16.6.0)"}
     if request_range:
         headers["Range"] = request_range
     timeout = aiohttp.ClientTimeout(total=None, sock_read=30)
@@ -239,18 +250,23 @@ async def reset_key(data: dict):
 async def stream(
     video_id: str,
     key: str = None,
-    type: str = Query("audio", regex="^(audio|video)$"),
-    quality: str = Query("high", regex="^(high|low|720|480|360)$"),
+    type: str = Query("audio"),
+    quality: str = Query(None),
     request: Request = None,
 ):
-    if not verify_and_track_request(key, media_type=type):
+    media_type = "video" if type and type.lower() == "video" else "audio"
+
+    if not quality:
+        quality = "720" if media_type == "video" else "high"
+
+    if not verify_and_track_request(key, media_type=media_type):
         raise HTTPException(status_code=403, detail="Invalid or unauthorized API key.")
 
-    media_url = await get_stream_url_cached(video_id, type, quality)
+    media_url = await get_stream_url_cached(video_id, media_type, quality)
     if not media_url:
         raise HTTPException(status_code=404, detail="Media stream unavailable.")
 
-    content_type = "video/mp4" if type == "video" else "audio/mpeg"
+    content_type = "video/mp4" if media_type == "video" else "audio/mp4"
     client_range = request.headers.get("range") if request else None
 
     return StreamingResponse(
@@ -258,6 +274,7 @@ async def stream(
         media_type=content_type,
         headers={
             "Accept-Ranges": "bytes",
+            "Content-Type": content_type,
             "Cache-Control": "public, max-age=31536000, immutable",
             "Access-Control-Allow-Origin": "*",
             "X-Powered-By": "MusicAPI-Engine/3.0",
@@ -361,11 +378,11 @@ async def index():
                 <div style="display:grid; grid-template-columns: 2fr 1fr 1fr auto; gap:10px; margin-top:10px;">
                     <input type="text" id="testVidId" placeholder="Video ID (e.g. dQw4w9WgXcQ)" style="margin:0;">
                     <select id="testType" style="margin:0;" onchange="updateQualityDropdown()">
-                        <option value="audio">Audio</option>
+                        <option value="audio">Audio (Auto-Quality)</option>
                         <option value="video">Video</option>
                     </select>
                     <select id="testQuality" style="margin:0;">
-                        <option value="high">High (Default)</option>
+                        <option value="high">High (Default 128kbps)</option>
                         <option value="low">Low</option>
                     </select>
                     <button class="btn btn-primary" onclick="testMedia()">Load Stream</button>
@@ -375,10 +392,14 @@ async def index():
         </div>
         <div class="card">
             <h2>API Documentation</h2>
-            <h3 style="margin-top:20px; font-size:1rem; color:var(--primary);">1. Audio Stream</h3>
-            <div class="code-box">GET /stream/{VIDEO_ID}?type=audio&quality=high&key=YOUR_API_KEY</div>
+            <h3 style="margin-top:20px; font-size:1rem; color:var(--primary);">1. Audio Stream (Default)</h3>
+            <div class="code-box">GET /stream/{VIDEO_ID}?key=YOUR_API_KEY</div>
+            <p style="font-size:0.85rem; color:var(--muted); margin-top:6px;">Auto-defaults to high-quality 128kbps AAC native audio and increments your audio counter.</p>
+
             <h3 style="margin-top:20px; font-size:1rem; color:var(--primary);">2. Video Stream</h3>
-            <div class="code-box">GET /stream/{VIDEO_ID}?type=video&quality=720&key=YOUR_API_KEY</div>
+            <div class="code-box">GET /stream/{VIDEO_ID}?type=video&key=YOUR_API_KEY</div>
+            <p style="font-size:0.85rem; color:var(--muted); margin-top:6px;">Auto-defaults to 720p HD MP4 (progressive audio+video) and increments your video counter.</p>
+
             <h3 style="margin-top:20px; font-size:1rem; color:var(--primary);">3. Track Search</h3>
             <div class="code-box">GET /search?query=unstoppable&limit=5&key=YOUR_API_KEY</div>
         </div>
@@ -397,8 +418,8 @@ async def index():
         let curMode = 'login';
         let u = localStorage.getItem('m_user');
         let k = localStorage.getItem('m_key');
-        let audioCount = localStorage.getItem('m_audio_count') || 0;
-        let videoCount = localStorage.getItem('m_video_count') || 0;
+        let audioCount = parseInt(localStorage.getItem('m_audio_count') || 0);
+        let videoCount = parseInt(localStorage.getItem('m_video_count') || 0);
 
         function syncUI() {
             if(u && k) {
@@ -500,7 +521,7 @@ async def index():
                 document.getElementById('videoReqCount').innerText = videoCount;
                 localStorage.setItem('m_video_count', videoCount);
             } else {
-                container.innerHTML = `<audio controls autoplay src="${src}" style="filter: invert(0.85) hue-rotate(180deg);"></audio>`;
+                container.innerHTML = `<audio controls autoplay src="${src}"></audio>`;
                 audioCount++;
                 document.getElementById('audioReqCount').innerText = audioCount;
                 localStorage.setItem('m_audio_count', audioCount);
